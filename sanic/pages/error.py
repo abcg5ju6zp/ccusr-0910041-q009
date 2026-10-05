@@ -53,11 +53,26 @@ class ErrorPage(BasePage):
         self.doc._script(tracerite.html.javascript)
         super()._head()
 
+    def _correlation_id(self):
+        """返回本次请求的关联标识；取不到时返回 None。"""
+        try:
+            rid = self.request.id
+        except Exception:  # pragma: no cover
+            return None
+        return str(rid) if rid is not None else None
+
     def _body(self) -> None:
         debug = self.request.app.debug
         route_name = self.request.name or "[route not found]"
         with self.doc.main:
             self.doc.h1(f"⚠️ {self.title}").p(self.text)
+            # 关联标识：即使在生产视图也展示，方便运维人员把页面上报
+            # 与服务端日志对应起来（响应头中同样携带）。
+            correlation_id = self._correlation_id()
+            if correlation_id is not None:
+                self.doc.p(
+                    f"Request ID: {correlation_id}", class_="request-id"
+                )
             # Show context details if available on the exception
             context = getattr(self.exc, "context", None)
             if context:

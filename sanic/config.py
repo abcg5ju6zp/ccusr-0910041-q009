@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "AUTO_RELOAD": False,
     "EVENT_AUTOREGISTER": False,
     "DEPRECATION_FILTER": "once",
+    "ERROR_REPRESENTATION_VERSION": "1.0",
     "FORWARDED_FOR_HEADER": "X-Forwarded-For",
     "FORWARDED_SECRET": None,  # nosec B105
     "GRACEFUL_SHUTDOWN_TIMEOUT": 15.0,
@@ -102,6 +103,7 @@ class Config(dict, metaclass=DescriptorMeta):
     AUTO_RELOAD: bool
     EVENT_AUTOREGISTER: bool
     DEPRECATION_FILTER: FilterWarningType
+    ERROR_REPRESENTATION_VERSION: str
     FORWARDED_FOR_HEADER: str
     FORWARDED_SECRET: str | None
     GRACEFUL_SHUTDOWN_TIMEOUT: float

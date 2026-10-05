@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from sanic.errorpages import BaseRenderer, TextRenderer, exception_response
+from sanic.errorpages import (
+    BaseRenderer,
+    ErrorRepresentationRegistry,
+    TextRenderer,
+    minimal_fallback,
+    render_error_response,
+)
 from sanic.exceptions import ServerError
 from sanic.log import error_logger
 from sanic.models.handler_types import RouteHandler
@@ -10,7 +16,12 @@ from sanic.response.types import HTTPResponse
 
 
 class ErrorHandler:
-    """项目内部接口说明。"""
+    """异常处理器：自定义处理器查找 + 版本化错误表示注册表渲染。
+
+    每个 ErrorHandler 持有一个 :class:`ErrorRepresentationRegistry`，
+    默认错误响应按异常层级 × 路由范围 × 媒体类型 × 安全级别选择
+    渲染器；处理器或渲染器再次失败时走可预测的最小回退。
+    """
 
     def __init__(
         self,
@@ -21,6 +32,7 @@ class ErrorHandler:
         ] = {}
         self.debug = False
         self.base = base
+        self.registry = ErrorRepresentationRegistry(base=base)
 
     def _full_lookup(self, exception, route_name: str | None = None):
         return self.lookup(exception, route_name)
@@ -88,7 +100,9 @@ class ErrorHandler:
                 response = handler(request, exception)
             if response is None:
                 response = self.default(request, exception)
-        except Exception:
+        except Exception as handler_failure:
+            # 自定义异常处理器（或其渲染过程）失败：不能再让异常向上
+            # 传播，统一交给可预测的最小回退表示。
             try:
                 url = repr(request.url)
             except AttributeError:  # no cov
@@ -96,24 +110,42 @@ class ErrorHandler:
             response_message = (
                 'Exception raised in exception handler "%s" for uri: %s'
             )
-            error_logger.exception(response_message, handler.__name__, url)
+            error_logger.exception(
+                response_message, getattr(handler, "__name__", "<unknown>"), url
+            )
 
             if self.debug:
-                return text(response_message % (handler.__name__, url), 500)
-            else:
-                return text("An error occurred while handling an error", 500)
+                # 调试模式保留历史上的详细文本，便于定位失败的处理器。
+                return text(
+                    response_message
+                    % (getattr(handler, "__name__", "<unknown>"), url),
+                    500,
+                )
+            return minimal_fallback(
+                request,
+                status=500,
+                debug=False,
+                failure=handler_failure,
+            )
         return response
 
     def default(self, request: Request, exception: Exception) -> HTTPResponse:
         """项目内部接口说明。"""
         self.log(request, exception)
-        fallback = request.app.config.FALLBACK_ERROR_FORMAT
-        return exception_response(
+        config = request.app.config if request is not None else None
+        fallback = getattr(config, "FALLBACK_ERROR_FORMAT", "auto")
+        version = getattr(
+            config,
+            "ERROR_REPRESENTATION_VERSION",
+            self.registry.version,
+        )
+        return render_error_response(
             request,
             exception,
             debug=self.debug,
-            base=self.base,
             fallback=fallback,
+            registry=self.registry,
+            version=version,
         )
 
     @staticmethod
