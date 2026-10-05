@@ -1,10 +1,33 @@
-"""项目内部接口说明。"""
+"""版本化错误表示注册表与渲染选择。
+
+同一个服务往往同时面向机器客户端（按固定媒体类型解析响应体）与运维
+人员（在浏览器里查看调试页）。本模块把"如何展示一个异常"拆成三层：
+
+1. :class:`ErrorRepresentation` —— 错误表示的版本化注册表条目，绑定
+   媒体类型、渲染器与回退顺序；
+2. :func:`select_representation` / :func:`guess_mime` —— 根据异常层级、
+   路由范围（路由 > 蓝图 > 全局 FALLBACK_ERROR_FORMAT）、Accept 协商
+   结果选择表示；
+3. :func:`exception_response` —— 以选定表示渲染，渲染器自身再次失败时
+   沿注册表声明的回退链降级到可预测的最小响应。
+
+所有错误响应都会：
+
+* 回带关联标识（``X-Request-ID``，头名取自 ``REQUEST_ID_HEADER``），
+  JSON 表示体中同时给出 ``request_id``；
+* 只暴露允许公开的上下文（``context`` 总是随表示输出，``extra``、
+  堆栈等仅调试模式输出）；
+* 通过 ``Vary`` / ``Cache-Control`` 反映内容协商结果与"默认不缓存"的
+  策略。
+"""
 
 from __future__ import annotations
 
 import sys
 import typing as t
 
+from dataclasses import dataclass
+from enum import IntEnum
 from functools import partial
 from traceback import extract_tb
 
@@ -12,7 +35,7 @@ from sanic.exceptions import BadRequest, SanicException
 from sanic.helpers import STATUS_CODES
 from sanic.log import deprecation, logger
 from sanic.pages.error import ErrorPage
-from sanic.response import html, json, text
+from sanic.response import HTTPResponse, html, json, text
 
 
 dumps: t.Callable[..., str]
@@ -24,7 +47,7 @@ except ImportError:  # noqa
     from json import dumps
 
 if t.TYPE_CHECKING:
-    from sanic import HTTPResponse, Request
+    from sanic import Request
 
 DEFAULT_FORMAT = "auto"
 FALLBACK_TEXT = """\
@@ -32,6 +55,60 @@ The application encountered an unexpected error and could not continue.\
 """
 FALLBACK_STATUS = 500
 JSON = "application/json"
+
+# 缓存相关响应头
+VARY = "Vary"
+CACHE_CONTROL = "Cache-Control"
+CACHE_CONTROL_VALUE = "no-store"
+CONTENT_TYPE_OPTIONS = "X-Content-Type-Options"
+CONTENT_TYPE_OPTIONS_VALUE = "nosniff"
+
+
+class SecurityLevel(IntEnum):
+    """异常信息的敏感级别，决定可向客户端公开的内容。
+
+    所有渲染器在非调试模式下都不得输出堆栈与 ``extra``；消息本身仅在
+    :attr:`UNEXPECTED` 级别被替换为固定文案。自定义渲染器可按级别
+    进一步收敛输出。
+    """
+
+    # 客户端错误（4xx）或调试模式：消息是有意返回给调用方的，公开
+    SAFE = 1
+    # 服务端有意抛出的 5xx SanicException：消息仍可公开，但被标记为
+    # 敏感，自定义表示可选择只输出状态短语
+    SENSITIVE = 2
+    # 非 SanicException 的未预期异常：生产模式只回固定文案，
+    # 绝不回显 str(exception)，以免泄露内部细节
+    UNEXPECTED = 3
+
+    @classmethod
+    def of(cls, exception: Exception, debug: bool) -> "SecurityLevel":
+        """项目内部接口说明。"""
+        if debug:
+            return cls.SAFE
+        if not isinstance(exception, SanicException):
+            return cls.UNEXPECTED
+        status = getattr(exception, "status_code", FALLBACK_STATUS) or 0
+        return cls.SAFE if status < 500 else cls.SENSITIVE
+
+
+@dataclass(frozen=True)
+class ErrorRepresentation:
+    """注册表中的一个版本化错误表示。
+
+    :param version: 表示版本号，便于未来在不破坏既有媒体类型消费者的
+        情况下演进错误体结构。
+    :param mime: 该表示的具体媒体类型。
+    :param renderer: 渲染器类。
+    :param fallback_keys: 该表示渲染失败时的回退顺序（注册表里的
+        ``key``），最终回退由最小文本响应兜底。
+    """
+
+    version: int
+    mime: str
+    renderer: t.Type["BaseRenderer"]
+    fallback_keys: t.Tuple[str, ...] = ()
+    aliases: t.Tuple[str, ...] = ()
 
 
 class BaseRenderer:
@@ -43,13 +120,15 @@ class BaseRenderer:
         self.request = request
         self.exception = exception
         self.debug = debug
+        self.security = SecurityLevel.of(exception, debug)
 
     @property
     def headers(self) -> t.Dict[str, str]:
         """项目内部接口说明。"""
+        headers: t.Dict[str, str] = {}
         if isinstance(self.exception, SanicException):
-            return getattr(self.exception, "headers", {})
-        return {}
+            headers.update(getattr(self.exception, "headers", {}) or {})
+        return headers
 
     @property
     def status(self):
@@ -61,9 +140,18 @@ class BaseRenderer:
     @property
     def text(self):
         """项目内部接口说明。"""
-        if self.debug or isinstance(self.exception, SanicException):
-            return str(self.exception)
-        return FALLBACK_TEXT
+        if self.security is SecurityLevel.UNEXPECTED:
+            return FALLBACK_TEXT
+        return str(self.exception)
+
+    @property
+    def request_id(self) -> t.Optional[str]:
+        """关联标识：请求自带则回显，否则惰性生成后回带。"""
+        try:
+            value = self.request.id
+        except Exception:
+            return None
+        return None if value is None else str(value)
 
     @property
     def title(self):
@@ -79,8 +167,27 @@ class BaseRenderer:
             else self.minimal
         )()
         output.status = self.status
-        output.headers.update(self.headers)
+        # 异常自带的响应头（Allow、WWW-Authenticate、Content-Range 等）
+        # 拥有最高优先级；协商/缓存/关联头只做补全。
+        _update_missing(output.headers, self._negotiation_headers())
+        for key, value in self.headers.items():
+            output.headers[key] = value
         return output
+
+    def _negotiation_headers(self) -> t.Dict[str, str]:
+        """协商结果与安全/缓存相关的通用响应头。"""
+        headers = {
+            CACHE_CONTROL: CACHE_CONTROL_VALUE,
+            CONTENT_TYPE_OPTIONS: CONTENT_TYPE_OPTIONS_VALUE,
+        }
+        request_id = self.request_id
+        if request_id is not None:
+            try:
+                header_name = self.request.app.config.REQUEST_ID_HEADER
+            except Exception:
+                header_name = "X-Request-ID"
+            headers[header_name] = request_id
+        return headers
 
     def minimal(self) -> HTTPResponse:  # noqa
         """项目内部接口说明。"""
@@ -186,6 +293,8 @@ class TextRenderer(BaseRenderer):
 class JSONRenderer(BaseRenderer):
     """项目内部接口说明。"""
 
+    REPRESENTATION_VERSION = 1
+
     def full(self) -> HTTPResponse:
         output = self._generate_output(full=True)
         return json(output, dumps=self.dumps)
@@ -200,6 +309,10 @@ class JSONRenderer(BaseRenderer):
             "status": self.status,
             "message": self.text,
         }
+
+        request_id = self.request_id
+        if request_id is not None:
+            output["request_id"] = request_id
 
         for attr, display in (("context", True), ("extra", bool(full))):
             info = getattr(self.exception, attr, None)
@@ -244,12 +357,84 @@ def escape(text):
     return f"{text}".replace("&", "&amp;").replace("<", "&lt;")
 
 
+# --------------------------------------------------------------------- #
+# 版本化错误表示注册表
+# --------------------------------------------------------------------- #
+#
+# key 既是历史上的 "format" 名（text/json/html，供 FALLBACK_ERROR_FORMAT、
+# error_format 与 RESPONSE_MAPPING 使用），也是回退链里引用的名字。
+# 注册表按 version 注册，新增表示版本应使用新的 key（如 "json-v2"），
+# 并在需要时把别名（既有 mime）指向新版本。
 MIME_BY_CONFIG = {
     "text": "text/plain",
     "json": "application/json",
     "html": "text/html",
 }
 CONFIG_BY_MIME = {v: k for k, v in MIME_BY_CONFIG.items()}
+
+REPRESENTATION_REGISTRY: t.Dict[str, ErrorRepresentation] = {}
+
+
+def register_representation(
+    key: str,
+    representation: ErrorRepresentation,
+) -> ErrorRepresentation:
+    """注册（或覆盖）一个错误表示。"""
+    REPRESENTATION_REGISTRY[key] = representation
+    return representation
+
+
+def get_representation(key: str) -> t.Optional[ErrorRepresentation]:
+    """项目内部接口说明。"""
+    return REPRESENTATION_REGISTRY.get(key)
+
+
+def representation_for_mime(mime: str) -> t.Optional[ErrorRepresentation]:
+    """按具体媒体类型（含注册别名）查找表示。"""
+    for representation in REPRESENTATION_REGISTRY.values():
+        if mime == representation.mime or mime in representation.aliases:
+            return representation
+    return None
+
+
+def _register_defaults() -> None:
+    # JSON 最适合机器客户端，故任意表示渲染失败时优先向它回退；
+    # text 是最小的人类可读表示；最后的兜底由 minimal_fallback 完成。
+    register_representation(
+        "json",
+        ErrorRepresentation(
+            version=1,
+            mime="application/json",
+            renderer=JSONRenderer,
+            fallback_keys=("text",),
+        ),
+    )
+    register_representation(
+        "text",
+        ErrorRepresentation(
+            version=1,
+            mime="text/plain",
+            renderer=TextRenderer,
+            fallback_keys=("json",),
+        ),
+    )
+    register_representation(
+        "html",
+        ErrorRepresentation(
+            version=1,
+            mime="text/html",
+            renderer=HTMLRenderer,
+            # 调试页依赖 tracerite/html5tagger，一旦渲染失败，退回机器与
+            # 纯文本消费者都能处理的表示，而不是抛出半个 HTML 页面。
+            fallback_keys=("json", "text"),
+            aliases=("multipart/form-data",),
+        ),
+    )
+
+
+_register_defaults()
+
+# 向后兼容的模块级名字
 RENDERERS_BY_CONTENT_TYPE = {
     "text/plain": TextRenderer,
     "application/json": JSONRenderer,
@@ -276,6 +461,75 @@ def check_error_format(format):
         raise SanicException(f"Unknown format: {format}")
 
 
+def _update_missing(
+    target: t.MutableMapping[str, str], values: t.Mapping[str, str]
+) -> None:
+    for key, value in values.items():
+        target.setdefault(key, value)
+
+
+def _merge_vary(headers: t.MutableMapping[str, str]) -> None:
+    """把 Accept 并入已有的 Vary 值（保留大小写与既有条目）。"""
+    existing = None
+    for key in headers:
+        if key.lower() == VARY.lower():
+            existing = headers[key]
+            break
+    if existing:
+        values = {part.strip() for part in existing.split(",") if part.strip()}
+        values.add("Accept")
+        headers[VARY] = ", ".join(sorted(values))
+    else:
+        headers[VARY] = "Accept"
+
+
+def minimal_fallback(
+    request: t.Optional[Request],
+    exception: Exception,
+) -> HTTPResponse:
+    """最终的可预测最小回退。
+
+    不依赖任何可能再次失败的复杂渲染逻辑：固定文案的 ``text/plain``
+    响应，只补缓存/安全头与关联标识。它本身不得抛出。
+    """
+    status = FALLBACK_STATUS
+    headers: t.Dict[str, str] = {
+        CACHE_CONTROL: CACHE_CONTROL_VALUE,
+        CONTENT_TYPE_OPTIONS: CONTENT_TYPE_OPTIONS_VALUE,
+    }
+    if isinstance(exception, SanicException):
+        status = getattr(exception, "status_code", FALLBACK_STATUS) or status
+        for key, value in (getattr(exception, "headers", None) or {}).items():
+            headers[key] = value
+
+    request_id: t.Optional[str] = None
+    if request is not None:
+        try:
+            raw_id = request.id
+            if raw_id is not None:
+                request_id = str(raw_id)
+                header_name = request.app.config.REQUEST_ID_HEADER
+                headers[header_name] = request_id
+        except Exception:
+            request_id = None
+
+    try:
+        response = text(FALLBACK_TEXT, status, headers)
+    except Exception:
+        response = HTTPResponse(FALLBACK_TEXT.encode(), status=status)
+        for key, value in headers.items():
+            try:
+                response.headers[key] = value
+            except Exception:
+                continue
+
+    try:
+        _merge_vary(response.headers)
+    except Exception:
+        pass
+    return response
+
+
 def exception_response(
     request: Request,
     exception: Exception,
@@ -284,17 +538,116 @@ def exception_response(
     base: t.Type[BaseRenderer],
     renderer: t.Optional[t.Type[BaseRenderer]] = None,
 ) -> HTTPResponse:
-    """项目内部接口说明。"""
-    if not renderer:
-        mt = guess_mime(request, fallback)
-        renderer = RENDERERS_BY_CONTENT_TYPE.get(mt, base)
+    """渲染异常响应。
 
-    renderer = t.cast(t.Type[BaseRenderer], renderer)
-    return renderer(request, exception, debug).render()
+    选择顺序：显式 ``renderer`` → 注册表中按协商结果选出的表示 →
+    ``base`` 渲染器。任意渲染器抛出时，沿该表示声明的
+    ``fallback_keys`` 回退，最后由 :func:`minimal_fallback` 兜底。
+    """
+    negotiation = guess_mime(request, fallback)
+    representation: t.Optional[ErrorRepresentation] = None
+    if renderer is None:
+        if negotiation.mime:
+            representation = representation_for_mime(negotiation.mime)
+        if representation is not None:
+            selected: t.Type[BaseRenderer] = representation.renderer
+        elif negotiation.mime:
+            selected = RENDERERS_BY_CONTENT_TYPE.get(negotiation.mime, base)
+        else:
+            selected = base
+    else:
+        selected = renderer
+        # 显式渲染器：若它本身已注册，则按其注册表示的回退链降级
+        representation = representation_for_mime(_mime_for_renderer(selected))
+
+    chain: t.List[t.Type[BaseRenderer]] = [selected]
+    if representation is not None:
+        for key in representation.fallback_keys:
+            fallback_repr = REPRESENTATION_REGISTRY.get(key)
+            if fallback_repr and fallback_repr.renderer not in chain:
+                chain.append(fallback_repr.renderer)
+
+    last_error: t.Optional[BaseException] = None
+    response: t.Optional[HTTPResponse] = None
+    for candidate in chain:
+        try:
+            response = candidate(request, exception, debug).render()
+            break
+        except Exception as e:  # renderer failed; try the next representation
+            last_error = e
+            logger.error(
+                "Error renderer %s failed (%s); falling back",
+                getattr(candidate, "__name__", candidate),
+                e,
+            )
+
+    if response is None:
+        logger.error(
+            "All error renderers failed; using minimal fallback",
+            exc_info=last_error,
+        )
+        return minimal_fallback(request, exception)
+
+    # 错误表示始终会随 Accept 变化：即使路由用 error_format 固定了首选
+    # 表示，客户端若完全不接受该媒体类型也会改走别的渲染器/回退链。
+    # 因此用 Vary 告知共享缓存按 Accept 区分；若异常自身带了 Vary，
+    # 保留并合并其条目。
+    try:
+        _merge_vary(response.headers)
+    except Exception:
+        pass
+
+    return response
 
 
-def guess_mime(req: Request, fallback: str) -> str:
-    """项目内部接口说明。"""
+def _mime_for_renderer(renderer: t.Type[BaseRenderer]) -> str:
+    for representation in REPRESENTATION_REGISTRY.values():
+        if representation.renderer is renderer:
+            return representation.mime
+    return ""
+
+
+class NegotiatedMime(str):
+    """协商出的 mime 字符串，同时携带协商元信息。
+
+    对历史调用方它就是普通 ``str``；注册表选择与缓存头逻辑可额外读取
+    :attr:`used_accept`、:attr:`source` 等属性。
+    """
+
+    mime: str
+    used_accept: bool
+    format_name: str
+    source: str
+    forced_format: t.Optional[str]
+
+    def __new__(
+        cls,
+        mime: str,
+        *,
+        used_accept: bool = False,
+        format_name: str = "",
+        source: str = "",
+        forced_format: t.Optional[str] = None,
+    ) -> "NegotiatedMime":
+        obj = super().__new__(cls, mime)
+        obj.mime = mime
+        obj.used_accept = used_accept
+        obj.format_name = format_name
+        obj.source = source
+        obj.forced_format = forced_format
+        return obj
+
+
+def guess_mime(
+    req: Request,
+    fallback: str,
+) -> "NegotiatedMime":
+    """项目内部接口说明。
+
+    返回值在字符串用法下与历史行为一致（协商出的 mime，未命中时为空
+    串），同时携带协商元信息（是否依赖 Accept、来源、被强制的格式）
+    供注册表选择与缓存头使用。
+    """
     # Attempt to find a suitable MIME format for the response.
     # Insertion-ordered map of formats["html"] = "source of that suggestion"
     formats = {}
@@ -342,18 +695,34 @@ def guess_mime(req: Request, fallback: str) -> str:
 
     mimes = [MIME_BY_CONFIG[k] for k in formats]
     m = req.accept.match(*mimes)
+
+    forced_format = next(
+        (fmt for fmt, source in formats.items() if source != "any"), None
+    )
     if m:
-        format = CONFIG_BY_MIME[m.mime]
-        source = formats[format]
+        format_name = CONFIG_BY_MIME[m.mime]
+        source = formats[format_name]
+        # 显式的路由/回退配置本身就是决定性的；只有在 "any" 候选里
+        # 通过 Accept 挑出来时才是真正的协商结果。
+        used_accept = source == "any" or (
+            source in ("request.accept", "content-type", "request.json")
+        )
         logger.debug(
             "Error Page: The client accepts %s, using '%s' from %s",
             m.header,
-            format,
+            format_name,
             source,
         )
-    else:
-        logger.debug(
-            "Error Page: No format found, the client accepts %s",
-            repr(req.accept),
+        return NegotiatedMime(
+            m.mime,
+            used_accept=used_accept,
+            format_name=format_name,
+            source=source,
+            forced_format=forced_format,
         )
-    return m.mime
+
+    logger.debug(
+        "Error Page: No format found, the client accepts %s",
+        repr(req.accept),
+    )
+    return NegotiatedMime(m.mime, forced_format=forced_format)
